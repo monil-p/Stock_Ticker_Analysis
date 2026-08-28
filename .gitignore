@@ -1,0 +1,33 @@
+# ---- Secrets & credentials -------------------------------------------
+.env
+.env.*
+!.env.example
+profiles.yml
+*service-account*.json
+*-sa.json
+gcp-key*.json
+credentials.json
+keyfile.json
+
+# ---- Python ----------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ---- dbt -------------------------------------------------------------
+target/
+dbt_packages/
+logs/
+.user.yml
+
+# ---- Editors & OS ----------------------------------------------------
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
