@@ -1,0 +1,150 @@
+version: 2
+
+models:
+  - name: stg_alpha_vantage__daily_prices
+    description: >
+      One row per ticker per trading session, typed and deduplicated.
+
+      Casting and renaming happen here and nowhere upstream: the raw table is
+      all STRING by design. Because raw is append-only, the same session can
+      appear several times with different _extracted_at values; this model
+      keeps only the most recently extracted observation of each
+      (ticker, trade_date).
+
+      Prices are UNADJUSTED. Splits and dividends are not backed out, so a
+      return computed across a split date will show an artificial jump.
+    columns:
+      - name: ticker
+        description: Ticker symbol, e.g. "AAPL".
+        data_tests:
+          - not_null
+      - name: trade_date
+        description: Session date, cast to DATE.
+        data_tests:
+          - not_null
+      - name: open_price
+        description: Opening price, unadjusted. NUMERIC to avoid float drift.
+        data_tests:
+          - not_null
+      - name: high_price
+        description: Session high, unadjusted.
+        data_tests:
+          - not_null
+      - name: low_price
+        description: Session low, unadjusted.
+        data_tests:
+          - not_null
+      - name: close_price
+        description: Closing price, unadjusted.
+        data_tests:
+          - not_null
+      - name: volume
+        description: Shares traded during the session.
+        data_tests:
+          - not_null
+      - name: _extracted_at
+        description: >
+          UTC timestamp of the API call this row survived deduplication from.
+          Carried through so downstream models can trace a value back to the
+          extract that produced it.
+        data_tests:
+          - not_null
+
+    data_tests:
+      # The grain assertion. This is the test that proves deduplication works;
+      # it fails against raw and must pass here.
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - trade_date
+
+      # A session's high cannot be below its low. Cheap, and it catches column
+      # transposition -- the kind of mistake that produces plausible numbers.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "high_price >= low_price"
+
+      # Close must sit within the day's range.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "close_price between low_price and high_price"
+
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "volume >= 0"
+
+  - name: stg_alpha_vantage__companies
+    description: >
+      One row per ticker: the company profile behind each price series, typed
+      and deduplicated.
+
+      The OVERVIEW endpoint returns 57 fields; this model carries the six the
+      marts actually use. Adding more is cheap, but carrying all 57 because
+      they exist would push the "what does this column mean" problem downstream
+      onto whoever reads the docs.
+
+      Values are a SNAPSHOT, not history. market_cap is whatever it was at the
+      moment of the most recent extract, and this model keeps only that. If you
+      later want market cap over time, that is a dbt snapshot on this model,
+      not another column here.
+    columns:
+      - name: ticker
+        description: Ticker symbol. The grain of this model, and the join key
+          to the price models.
+        data_tests:
+          - unique
+          - not_null
+      - name: company_name
+        description: >
+          Registered company name, e.g. "Apple Inc.". Named company_name rather
+          than name so it stays unambiguous once joined to price models.
+        data_tests:
+          - not_null
+      - name: sector
+        description: Sector label, uppercase, e.g. "TECHNOLOGY".
+        data_tests:
+          - not_null
+          # Warn rather than error: a new ticker from an unlisted sector should
+          # get your attention, not break the nightly build.
+          - accepted_values:
+              config:
+                severity: warn
+              arguments:
+                values:
+                  - TECHNOLOGY
+                  - COMMUNICATION SERVICES
+                  - CONSUMER CYCLICAL
+                  - CONSUMER DEFENSIVE
+                  - FINANCIAL SERVICES
+                  - HEALTHCARE
+                  - ENERGY
+                  - INDUSTRIALS
+                  - UTILITIES
+                  - REAL ESTATE
+                  - BASIC MATERIALS
+      - name: industry
+        description: Industry label, finer-grained than sector.
+      - name: exchange
+        description: Listing exchange, e.g. "NASDAQ" or "NYSE".
+        data_tests:
+          - not_null
+      - name: currency
+        description: >
+          Reporting currency of market_cap. Carried deliberately: comparing
+          market caps across currencies without it would be silently wrong.
+        data_tests:
+          - not_null
+      - name: market_cap
+        description: Market capitalisation at extract time, in currency units.
+        data_tests:
+          - not_null
+      - name: _extracted_at
+        description: UTC timestamp of the extract this profile survived from.
+        data_tests:
+          - not_null
+
+    data_tests:
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "market_cap > 0"

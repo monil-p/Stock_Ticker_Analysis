@@ -1,0 +1,147 @@
+version: 2
+
+sources:
+  - name: alpha_vantage
+    description: >
+      Raw Alpha Vantage extracts, landed by extract/load_alpha_vantage.py.
+      Every column is STRING by design: the loader does structural work only
+      (exploding date-keyed objects into rows, and sanitising field names that
+      BigQuery would reject) and leaves all casting and renaming to staging.
+
+      These tables are APPEND-ONLY. Each run appends a fresh copy of whatever
+      window it fetched, stamped with _extracted_at, so duplicate
+      (symbol, trade_date) pairs are expected. Staging keeps the newest row
+      per key. That history is what makes upstream restatements visible.
+
+    # database is intentionally omitted so it inherits the target's project,
+    # which keeps this file working unchanged against dev, ci, and prod.
+    schema: raw
+    loader: python
+
+    config:
+      loaded_at_field: _extracted_at
+      # Sensible default; each table overrides it to match its own cadence.
+      freshness:
+        warn_after: {count: 36, period: hour}
+        error_after: {count: 72, period: hour}
+
+    tables:
+      - name: raw_daily_prices
+        description: >
+          Daily OHLCV bars from TIME_SERIES_DAILY. The free tier caps this
+          endpoint at outputsize=compact, so each extract returns only the most
+          recent 100 trading sessions. History beyond that window accumulates
+          here across runs, and is consolidated by the incremental fact model.
+
+          Prices are UNADJUSTED -- TIME_SERIES_DAILY_ADJUSTED is a premium
+          endpoint -- so splits and dividends are not backed out. Returns
+          computed from these closes will show artificial jumps on split dates.
+        config:
+          freshness:
+            warn_after: {count: 36, period: hour}
+            error_after: {count: 72, period: hour}
+        columns:
+          - name: symbol
+            description: Ticker the row was fetched for, e.g. "AAPL".
+            data_tests:
+              - not_null
+          - name: trade_date
+            description: Session date as an ISO string, e.g. "2026-08-27".
+            data_tests:
+              - not_null
+          - name: open
+            description: Opening price, unadjusted.
+          - name: high
+            description: Session high, unadjusted.
+          - name: low
+            description: Session low, unadjusted.
+          - name: close
+            description: Closing price, unadjusted.
+          - name: volume
+            description: Shares traded during the session.
+          - name: _extracted_at
+            description: UTC timestamp of the API call that produced this row.
+            data_tests:
+              - not_null
+          - name: _source_series
+            description: Response key the row was flattened from.
+
+      - name: raw_weekly_prices
+        description: >
+          Weekly OHLCV bars from TIME_SERIES_WEEKLY. Unlike the daily endpoint,
+          this one returns FULL history on the free tier -- roughly 1,400 weeks
+          back to 1999 -- in a single call per ticker. It is the source for any
+          long-horizon trend metric that 100 daily sessions cannot support.
+
+          Refreshed weekly rather than nightly to stay inside the 25 calls/day
+          budget, hence the much wider freshness window.
+        config:
+          freshness:
+            warn_after: {count: 8, period: day}
+            error_after: {count: 14, period: day}
+        columns:
+          - name: symbol
+            description: Ticker the row was fetched for.
+            data_tests:
+              - not_null
+          - name: trade_date
+            description: Week-ending session date as an ISO string.
+            data_tests:
+              - not_null
+          - name: open
+            description: First open of the week, unadjusted.
+          - name: high
+            description: Weekly high, unadjusted.
+          - name: low
+            description: Weekly low, unadjusted.
+          - name: close
+            description: Last close of the week, unadjusted.
+          - name: volume
+            description: Total shares traded during the week.
+          - name: _extracted_at
+            description: UTC timestamp of the API call that produced this row.
+            data_tests:
+              - not_null
+          - name: _source_series
+            description: Response key the row was flattened from.
+
+      - name: raw_company_overview
+        description: >
+          Company profile from the OVERVIEW endpoint, one row per ticker per
+          extract. Supplies sector, industry, and market cap for the company
+          dimension.
+
+          Field names arrive in PascalCase and are passed through unchanged
+          apart from BigQuery-legality fixes, so columns such as "52WeekHigh"
+          land as "_52WeekHigh". Not every field is documented below; the ones
+          listed are those the marts actually consume.
+
+          ETFs and index funds return an empty payload from this endpoint and
+          are skipped by the loader, so a ticker can have prices but no row
+          here. That is the orphan case the relationships test is meant to
+          catch, not a bug in the extract.
+        config:
+          freshness:
+            warn_after: {count: 35, period: day}
+            error_after: {count: 60, period: day}
+        columns:
+          - name: symbol
+            description: Ticker the profile was fetched for.
+            data_tests:
+              - not_null
+          - name: Name
+            description: Registered company name.
+          - name: Sector
+            description: Sector label, uppercase, e.g. "TECHNOLOGY".
+          - name: Industry
+            description: Industry label, finer-grained than Sector.
+          - name: Exchange
+            description: Listing exchange, e.g. "NASDAQ".
+          - name: Currency
+            description: Reporting currency of the financial fields.
+          - name: MarketCapitalization
+            description: Market cap at extract time, in Currency units.
+          - name: _extracted_at
+            description: UTC timestamp of the API call that produced this row.
+            data_tests:
+              - not_null
