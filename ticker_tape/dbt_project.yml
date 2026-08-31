@@ -37,7 +37,10 @@ models:
 
     intermediate:
       +schema: intermediate
-      +materialized: ephemeral
+      # view, not ephemeral: an ephemeral model never creates its dataset, so
+      # unit tests have nowhere to materialise, and you cannot select from it
+      # in the console when debugging. Two extra views is a cheap price.
+      +materialized: view
 
     marts:
       +schema: marts

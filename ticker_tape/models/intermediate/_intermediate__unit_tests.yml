@@ -1,0 +1,73 @@
+version: 2
+
+unit_tests:
+  - name: test_daily_returns_logic
+    model: int_prices_daily_returns
+    description: >
+      Exercises the return calculation against three hand-built sessions whose
+      answers are known by hand, rather than against whatever the API happened
+      to return today.
+
+      Three behaviours are asserted at once. First, a ticker's earliest session
+      has no prior close, so prev_close_price, daily_return and
+      days_since_prev_session must all be NULL -- the behaviour the not_null
+      tests deliberately do not cover. Second, the return is
+      (close - prev_close) / prev_close: 100 to 125 is exactly 0.25, chosen
+      because 0.25 is exactly representable in binary floating point so the
+      assertion cannot fail on rounding. Third, lag() is partitioned by ticker,
+      so BBB's only row must come back NULL rather than borrowing AAA's close
+      of 125. Without that partition the numbers stay plausible, no test on
+      real data fails, and the pipeline is silently wrong -- which is precisely
+      the failure this catches.
+
+      The weekend gap is real: 2026-01-02 is a Friday and 2026-01-05 the
+      following Monday, so days_since_prev_session is 3, not 1.
+
+    given:
+      - input: ref('stg_alpha_vantage__daily_prices')
+        rows:
+          - ticker: AAA
+            trade_date: "2026-01-02"
+            open_price: 99.00
+            high_price: 101.00
+            low_price: 98.00
+            close_price: 100.00
+            volume: 1000
+            _extracted_at: "2026-01-06 00:00:00"
+          - ticker: AAA
+            trade_date: "2026-01-05"
+            open_price: 100.00
+            high_price: 126.00
+            low_price: 100.00
+            close_price: 125.00
+            volume: 2000
+            _extracted_at: "2026-01-06 00:00:00"
+          - ticker: BBB
+            trade_date: "2026-01-05"
+            open_price: 50.00
+            high_price: 51.00
+            low_price: 49.00
+            close_price: 50.00
+            volume: 3000
+            _extracted_at: "2026-01-06 00:00:00"
+
+    expect:
+      rows:
+        # AAA's first session: nothing to compare against.
+        - ticker: AAA
+          trade_date: "2026-01-02"
+          prev_close_price:
+          daily_return:
+          days_since_prev_session:
+        # AAA's second session: 100 -> 125 is +25%, three calendar days later.
+        - ticker: AAA
+          trade_date: "2026-01-05"
+          prev_close_price: 100.00
+          daily_return: 0.25
+          days_since_prev_session: 3
+        # BBB's only session. Must NOT inherit AAA's 125.
+        - ticker: BBB
+          trade_date: "2026-01-05"
+          prev_close_price:
+          daily_return:
+          days_since_prev_session:
