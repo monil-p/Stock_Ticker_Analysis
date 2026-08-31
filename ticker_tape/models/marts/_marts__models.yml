@@ -1,0 +1,321 @@
+version: 2
+
+models:
+  - name: fct_daily_prices
+    description: >
+      One row per ticker per trading session: the OHLCV fact table.
+
+      This is the only incremental model in the project, and the reason is
+      specific. The free Alpha Vantage daily endpoint returns a rolling window
+      of just 100 sessions, so the raw layer can never hold more than that.
+      Building this table incrementally is what lets history accumulate past
+      the API's window: each run merges the latest 100 sessions into a table
+      that keeps everything it has ever seen.
+
+      Every other model in the project is a view or a table rebuilt in full.
+      Incrementality costs correctness guarantees, so it is worth paying for
+      only where it buys something, and here it buys history the source cannot
+      provide.
+
+      Restatement handling: the incremental filter re-reads a three-day tail
+      rather than strictly appending after max(trade_date), and the merge
+      overwrites on daily_price_key. A corrected close for a session already
+      loaded therefore lands on the next run instead of being ignored forever.
+
+      Prices are UNADJUSTED. Splits and dividends are not backed out.
+    columns:
+      - name: daily_price_key
+        description: >
+          Surrogate key: a deterministic hash of (ticker, trade_date). Also the
+          merge key, which is what makes a re-read of an existing session an
+          update rather than a duplicate insert.
+        data_tests:
+          - unique
+          - not_null
+      - name: ticker
+        description: Ticker symbol. Foreign key to dim_companies.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_companies')
+                field: ticker
+      - name: trade_date
+        description: >
+          Session date. The partition column: BigQuery prunes to the touched
+          partitions on both the incremental read and the merge.
+        data_tests:
+          - not_null
+      - name: open_price
+        description: Opening price, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: high_price
+        description: Session high, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: low_price
+        description: Session low, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: close_price
+        description: Closing price, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: volume
+        description: Shares traded during the session.
+        data_tests:
+          - not_null
+      - name: _extracted_at
+        description: >
+          UTC timestamp of the API call this row came from. Survives the merge,
+          so it always reflects the extract that produced the current values.
+      - name: _loaded_at
+        description: >
+          UTC timestamp of the dbt run that last wrote this row. Together with
+          _extracted_at this tells you both when the data was fetched and when
+          it was last modelled -- the pair that makes a restatement visible.
+
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - trade_date
+
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "high_price >= low_price"
+
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "close_price between low_price and high_price"
+
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "open_price between low_price and high_price"
+
+      # No session may be dated in the future. Catches timezone mistakes in the
+      # extract, which otherwise produce rows that look entirely normal.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "trade_date <= current_date()"
+
+  - name: dim_companies
+    description: >
+      One row per ticker: the company behind each price series. The dimension
+      that fct_daily_prices joins to on ticker.
+
+      Joined on the natural key rather than a surrogate. For a single source
+      with stable, unique tickers that is sufficient, and it keeps the join
+      readable in every downstream query. The tradeoff is worth stating: if
+      this model is ever converted to a Type 2 snapshot, ticker stops being
+      unique here -- there would be one row per version of the company -- and
+      a join on ticker would fan out and multiply fact rows. A surrogate key
+      per version would become necessary at that point, not before.
+
+      Values are a SNAPSHOT, not history. market_cap and sector reflect the
+      most recent extract only; no prior values are retained. Capturing change
+      over time is a dbt snapshot on stg_alpha_vantage__companies, not extra
+      columns here.
+
+      Coverage is not guaranteed. The OVERVIEW endpoint returns nothing for
+      ETFs and index funds, so a ticker can have prices with no row in this
+      dimension. The relationships test on fct_daily_prices.ticker is what
+      surfaces that.
+    columns:
+      - name: ticker
+        description: >
+          Ticker symbol. The grain of this model and the key
+          fct_daily_prices joins on.
+        data_tests:
+          - unique
+          - not_null
+      - name: company_name
+        description: >
+          Registered company name, e.g. "Apple Inc.". Named company_name rather
+          than name so it stays unambiguous once joined to the fact table.
+        data_tests:
+          - not_null
+      - name: sector
+        description: Sector label, uppercase, e.g. "TECHNOLOGY".
+        data_tests:
+          - not_null
+          # Warn, not error: a ticker from an unlisted sector is worth a look,
+          # not worth stopping the nightly build for.
+          - accepted_values:
+              config:
+                severity: warn
+              arguments:
+                values:
+                  - TECHNOLOGY
+                  - COMMUNICATION SERVICES
+                  - CONSUMER CYCLICAL
+                  - CONSUMER DEFENSIVE
+                  - FINANCIAL SERVICES
+                  - HEALTHCARE
+                  - ENERGY
+                  - INDUSTRIALS
+                  - UTILITIES
+                  - REAL ESTATE
+                  - BASIC MATERIALS
+      - name: industry
+        description: Industry label, finer-grained than sector.
+      - name: exchange
+        description: Listing exchange, e.g. "NASDAQ" or "NYSE".
+        data_tests:
+          - not_null
+      - name: currency
+        description: >
+          Reporting currency of market_cap. Carried deliberately: comparing
+          market caps across currencies without it would be silently wrong.
+        data_tests:
+          - not_null
+      - name: market_cap
+        description: Market capitalisation at extract time, in currency units.
+        data_tests:
+          - not_null
+      - name: _extracted_at
+        description: UTC timestamp of the extract this profile came from.
+        data_tests:
+          - not_null
+      - name: _loaded_at
+        description: UTC timestamp of the dbt run that last built this row.
+        data_tests:
+          - not_null
+
+    data_tests:
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "market_cap > 0"
+
+  - name: fct_ticker_performance_daily
+    description: >
+      The headline mart: one row per ticker per session, carrying price,
+      return, trailing moving averages, annualised volatility and the trend
+      signal. This is the table a dashboard or an analyst queries.
+
+      Read it alongside fct_daily_prices rather than instead of it. That model
+      is the incremental system of record for OHLCV and accumulates history
+      past the API's rolling window; this one is rebuilt in full from the
+      current staging window and exists to carry derived metrics. They share a
+      grain but not a purpose.
+
+      Every window counts SESSIONS, not calendar days -- a 30-session average
+      spans roughly six calendar weeks. Metrics are NULL until their window is
+      full, which is a deliberate refusal to present a 5-session average as a
+      30-session one, and is why the metric columns carry no not_null test.
+
+      Prices are UNADJUSTED, so returns spanning a split will show an
+      artificial jump. Volatility uses sqrt(252) annualisation.
+    columns:
+      - name: ticker
+        description: Ticker symbol. Foreign key to dim_companies.
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('dim_companies')
+                field: ticker
+      - name: trade_date
+        description: Session date.
+        data_tests:
+          - not_null
+      - name: open_price
+        description: Opening price, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: high_price
+        description: Session high, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: low_price
+        description: Session low, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: close_price
+        description: Closing price, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: daily_return
+        description: >
+          Simple return versus the previous session's close. FLOAT64 because a
+          ratio is not money. NULL on each ticker's earliest session, where
+          there is no prior close to compare against.
+      - name: close_ma_7_session
+        description: >
+          Mean close over the trailing 7 sessions. NULL until the ticker has
+          7 sessions of history.
+      - name: close_ma_30_session
+        description: >
+          Mean close over the trailing 30 sessions. NULL until the ticker has
+          30 sessions of history.
+      - name: close_ma_50_session
+        description: >
+          Mean close over the trailing 50 sessions. NULL until the ticker has
+          50 sessions of history.
+      - name: volatility_30_session_annualized
+        description: >
+          Sample standard deviation of daily returns over the trailing 30
+          sessions, multiplied by sqrt(252) to annualise. Expressed as a
+          fraction: 0.35 means 35% annualised.
+
+          Read it as "how violently has this name moved lately", which is the
+          plain-language version worth having ready.
+
+          NULL until session 31 -- one higher than the moving-average
+          threshold, because the earliest session has a NULL return and
+          stddev_samp skips NULLs.
+      - name: golden_cross_flag
+        description: >
+          TRUE when the 30-session average sits above the 50-session average:
+          the conventional short-over-long uptrend signal. NULL before session
+          50, where the 50-session average does not yet exist.
+
+          30/50 rather than the textbook 50/200 because the free daily endpoint
+          caps history at 100 sessions.
+      - name: volume
+        description: Shares traded during the session.
+        data_tests:
+          - not_null
+      - name: _extracted_at
+        description: UTC timestamp of the API call this row's prices came from.
+        data_tests:
+          - not_null
+      - name: _loaded_at
+        description: UTC timestamp of the dbt run that last built this row.
+        data_tests:
+          - not_null
+
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - trade_date
+
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "close_price between low_price and high_price"
+
+      # Annualised volatility is a standard deviation times a positive
+      # constant, so it cannot be negative.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "volatility_30_session_annualized >= 0"
+            where: "volatility_30_session_annualized is not null"
+
+      # The flag must agree with the averages it is derived from. Cheap, and it
+      # catches the crossover logic being inverted -- a mistake that produces
+      # entirely plausible-looking output.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: >
+              golden_cross_flag = (close_ma_30_session > close_ma_50_session)
+            where: "golden_cross_flag is not null"
+
+      # Both the flag and the 50-session average appear together or not at all.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "golden_cross_flag is null"
+            where: "close_ma_50_session is null"

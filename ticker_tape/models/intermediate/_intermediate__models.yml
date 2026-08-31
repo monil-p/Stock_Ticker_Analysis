@@ -1,0 +1,245 @@
+version: 2
+
+models:
+  - name: int_prices_daily_returns
+    description: >
+      Daily prices with the prior session attached and the simple return
+      computed. One row per ticker per session; the grain is unchanged from
+      staging.
+
+      The first session of each ticker has no prior row, so prev_close_price,
+      daily_return and days_since_prev_session are NULL there by design. That
+      is a correct answer to "what was the return on the first day we have
+      data", not missing data, which is why none of those columns carries a
+      not_null test.
+
+      Returns are computed from UNADJUSTED closes, so a split shows up as a
+      large spurious return on the split date. With 100 sessions of history
+      that is unlikely to bite, but it is a real limitation of the free tier
+      rather than something the SQL can fix.
+    columns:
+      - name: ticker
+        description: Ticker symbol.
+        data_tests:
+          - not_null
+      - name: trade_date
+        description: Session date.
+        data_tests:
+          - not_null
+      - name: prev_trade_date
+        description: >
+          Date of the previous session for this ticker. NULL on each ticker's
+          earliest row.
+      - name: days_since_prev_session
+        description: >
+          Calendar days between this session and the previous one. Typically 1
+          within a week and 3 across a weekend; larger values indicate market
+          holidays or a gap in the extract. NULL on each ticker's earliest row.
+      - name: open_price
+        description: Opening price, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: high_price
+        description: Session high, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: low_price
+        description: Session low, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: close_price
+        description: Closing price, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: prev_close_price
+        description: >
+          Previous session's close for this ticker, from lag(). NULL on each
+          ticker's earliest row.
+      - name: daily_return
+        description: >
+          Simple return versus the previous close:
+          (close_price - prev_close_price) / prev_close_price.
+
+          FLOAT64 rather than NUMERIC because this is a ratio, not money.
+          Computed with safe_divide so a zero prior close yields NULL instead
+          of erroring the build. NULL on each ticker's earliest row.
+      - name: volume
+        description: Shares traded during the session.
+        data_tests:
+          - not_null
+      - name: _extracted_at
+        description: UTC timestamp of the extract this row survived from.
+        data_tests:
+          - not_null
+
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - trade_date
+
+      # A daily move beyond +/-50% on a large-cap name is almost certainly a
+      # split or a data error rather than a real return. Warn, do not error:
+      # it is a prompt to look, not a reason to stop the build.
+      - dbt_utils.expression_is_true:
+          config:
+            severity: warn
+          arguments:
+            expression: "abs(daily_return) < 0.5"
+            where: "daily_return is not null"
+
+      # Sessions must move forward in time within a ticker.
+      - dbt_utils.expression_is_true:
+          config:
+            severity: warn
+          arguments:
+            expression: "prev_trade_date < trade_date"
+            where: "prev_trade_date is not null"
+
+  - name: int_prices_rolling_windows
+    description: >
+      Daily prices with trailing moving averages, annualised volatility and the
+      trend-crossover flag. One row per ticker per session; the grain is
+      unchanged from int_prices_daily_returns.
+
+      Every window counts ROWS, not calendar days. A "30 session" average spans
+      roughly six calendar weeks because markets close at weekends and on
+      holidays. The column names say _session for exactly that reason; naming
+      them _30d would be a documented falsehood.
+
+      Windows are suppressed until they are full. A 30-session average computed
+      from five sessions is a different statistic wearing the wrong label, so
+      those rows are NULL rather than partial. That makes the NULLs load-bearing
+      and is why the moving-average columns carry no not_null test.
+
+      The free daily endpoint only ever returns 100 sessions, which is why the
+      longest average here is 50 rather than the textbook 200. Long-horizon
+      trend belongs on the weekly source.
+    columns:
+      - name: ticker
+        description: Ticker symbol.
+        data_tests:
+          - not_null
+      - name: trade_date
+        description: Session date.
+        data_tests:
+          - not_null
+      - name: session_index
+        description: >
+          1-based position of this session within the ticker's history, oldest
+          first. Drives the window-completeness guards and is useful on its own
+          for reasoning about how much history a ticker has.
+        data_tests:
+          - not_null
+      - name: open_price
+        description: Opening price, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: high_price
+        description: Session high, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: low_price
+        description: Session low, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: close_price
+        description: Closing price, unadjusted, NUMERIC.
+        data_tests:
+          - not_null
+      - name: prev_close_price
+        description: Previous session's close. NULL on each ticker's first row.
+      - name: daily_return
+        description: >
+          Simple return versus the previous close. NULL on each ticker's first
+          row.
+      - name: days_since_prev_session
+        description: >
+          Calendar days since the previous session. 1 mid-week, 3 across a
+          weekend, more across holidays.
+      - name: close_ma_7_session
+        description: >
+          Mean close over the trailing 7 sessions, inclusive of this one.
+          NULL until the ticker has 7 sessions of history.
+      - name: close_ma_30_session
+        description: >
+          Mean close over the trailing 30 sessions, inclusive of this one.
+          NULL until the ticker has 30 sessions of history.
+      - name: close_ma_50_session
+        description: >
+          Mean close over the trailing 50 sessions, inclusive of this one.
+          NULL until the ticker has 50 sessions of history.
+      - name: volatility_30_session_annualized
+        description: >
+          Sample standard deviation of daily returns over the trailing 30
+          sessions, multiplied by sqrt(252) to annualise.
+
+          stddev_samp rather than stddev_pop: these sessions are a sample of the
+          ticker's return distribution, not the entire population. The sqrt(252)
+          factor follows from volatility scaling with the square root of time,
+          with roughly 252 trading sessions in a year.
+
+          NULL until session 31 -- one higher than the moving-average threshold,
+          because the earliest session has a NULL return and stddev_samp skips
+          NULLs, so a frame anchored at session 30 would hold only 29 returns.
+      - name: golden_cross_flag
+        description: >
+          TRUE when the 30-session average sits above the 50-session average,
+          the conventional short-over-long trend signal. NULL until both
+          averages exist, i.e. before session 50.
+
+          Uses 30/50 rather than the textbook 50/200 because the free daily
+          endpoint caps history at 100 sessions.
+      - name: volume
+        description: Shares traded during the session.
+        data_tests:
+          - not_null
+      - name: _extracted_at
+        description: UTC timestamp of the extract this row survived from.
+        data_tests:
+          - not_null
+
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - trade_date
+
+      # A moving average must sit inside the range of the prices it averages.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: >
+              close_ma_30_session between
+                (select min(close_price) from {{ ref('int_prices_rolling_windows') }})
+                and
+                (select max(close_price) from {{ ref('int_prices_rolling_windows') }})
+            where: "close_ma_30_session is not null"
+
+      # Annualised volatility is a standard deviation times a positive constant,
+      # so it can never be negative. Above 200% on a large cap is implausible
+      # enough to look at, but not a reason to fail the build.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "volatility_30_session_annualized >= 0"
+            where: "volatility_30_session_annualized is not null"
+
+      - dbt_utils.expression_is_true:
+          config:
+            severity: warn
+          arguments:
+            expression: "volatility_30_session_annualized < 2.0"
+            where: "volatility_30_session_annualized is not null"
+
+      # The completeness guards must actually hold: no moving average may
+      # appear before its window is full.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "close_ma_30_session is null"
+            where: "session_index < 30"
+
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "close_ma_50_session is null"
+            where: "session_index < 50"
