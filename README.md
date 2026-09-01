@@ -2,8 +2,8 @@
 
 An end-to-end ELT pipeline that pulls daily equity prices from the Alpha Vantage API into BigQuery, models them with dbt, and publishes a mart of moving averages, annualised volatility and trend signals.
 
-**Stack:** Python · BigQuery · dbt 1.12 · dbt-utils
-**Scale:** 7 models across 3 layers · 102 tests · ~23k source rows · $0/month
+**Stack:** Python · BigQuery · dbt 1.12 · dbt-utils · Looker Studio
+**Scale:** 8 models across 4 layers · 114 tests · ~23k source rows · $0/month
 
 ---
 
@@ -22,7 +22,12 @@ One row per ticker per trading session, carrying the metrics a desk actually loo
 | Johnson & Johnson | Healthcare | 265.77 | 21.8% | ✅ |
 | JPMorgan Chase & Co | Financial Services | 354.22 | 17.5% | ✅ |
 
-In plain terms: it fetches prices for eight large-cap stocks every night, works out how each one is trending and how violently it has been moving, and runs ~100 automated checks before publishing. If the data is wrong, the pipeline stops rather than quietly shipping bad numbers.
+**[View the live dashboard](https://datastudio.google.com/s/s1mqFkaO3Wc)** — price against its 30- and 50-session
+moving averages, annualised volatility, and a sector filter.
+
+![Ticker Tape dashboard](dashboard.png)
+
+In plain terms: it fetches prices for eight large-cap stocks every night, works out how each one is trending and how violently it has been moving, and runs over 100 automated checks before publishing. If the data is wrong, the pipeline stops rather than quietly shipping bad numbers.
 
 ---
 
@@ -36,6 +41,8 @@ flowchart LR
     STG --> INT["intermediate<br/>returns · rolling windows"]
     INT --> MARTS["marts<br/>dim + 2 facts"]
     STG --> MARTS
+    MARTS --> RPT["rpt_ticker_dashboard<br/>flat, denormalised"]
+    RPT --> BI["Looker Studio<br/>declared as a dbt exposure"]
 ```
 
 | Layer | Materialisation | Models | Job |
@@ -44,6 +51,7 @@ flowchart LR
 | `staging` | view | 2 | Cast, rename, deduplicate. Nothing else. |
 | `intermediate` | view | 2 | Returns, moving averages, volatility |
 | `marts` | table / incremental | 3 | `dim_companies`, `fct_daily_prices`, `fct_ticker_performance_daily` |
+| `reporting` | table | 1 | `rpt_ticker_dashboard` — one flat table for the BI layer |
 
 **The dividing line between E/L and T.** The Python loader does *structural* work only — Alpha Vantage returns a date-keyed object rather than an array, which SQL cannot explode cleanly, so Python flattens it into rows. It also sanitises field names BigQuery would reject (`1. open` → `open`, `52WeekHigh` → `_52WeekHigh`). Everything else — casting, renaming, business logic — is dbt's. Every raw column lands as `STRING`.
 
@@ -163,7 +171,7 @@ dbt build
 
 Its filter re-reads a **three-day tail** rather than strictly appending after `max(trade_date)`, and merges on `daily_price_key`. A strict cutoff would make an upstream restatement of an already-loaded session invisible forever.
 
-> ⚠️ Once this table has accumulated sessions beyond the API's 100-session window, `--full-refresh` becomes **destructive** — it rebuilds from staging and discards the accumulated history that is the entire point of the model.
+>Once this table has accumulated sessions beyond the API's 100-session window, `--full-refresh` becomes **destructive** — it rebuilds from staging and discards the accumulated history that is the entire point of the model.
 
 ### Joins use the natural key
 
@@ -171,13 +179,42 @@ Its filter re-reads a **three-day tail** rather than strictly appending after `m
 
 ---
 
+### The reporting layer
+
+`rpt_ticker_dashboard` is a flat, denormalised table built solely for the BI tool: `fct_ticker_performance_daily` joined to `dim_companies`, plus a few presentation conveniences. It carries no logic that is not already upstream.
+
+It exists because Looker Studio blends data sources awkwardly and re-runs the join on every chart interaction. One pre-joined table is faster to query and far simpler to build against. The `rpt_` prefix marks it as a consumer-facing shape rather than a dimensional model: **anything that needs to be correct lives upstream; only things that need to be convenient live here.**
+
+Two of those conveniences are worth explaining, because both are shaped by how the BI tool renders values rather than by the data:
+
+- **`trend_label`** is a three-valued string (`Uptrend` / `Downtrend` / `Insufficient history`) rather than the nullable `golden_cross_flag` boolean. Looker Studio renders NULL booleans as blanks in legends and filter controls, which reads as a rendering fault rather than a real state — and 392 of 800 rows are in that state.
+- **`is_latest_session` and `days_from_latest`** let scorecards show current values and charts use relative windows without date arithmetic in the UI.
+
+The dashboard is declared as a dbt **exposure**, so it appears as a downstream node in the lineage graph and `dbt build --select +exposure:ticker_tape_dashboard` rebuilds everything it depends on.
+
+---
+
+## Documentation
+
+dbt generates browsable documentation from the descriptions in the `_*.yml` files — every model and column in this project has one, along with the lineage graph and warehouse metadata (column types, table sizes) pulled from BigQuery.
+
+```bash
+cd ticker_tape
+dbt docs generate   # writes target/index.html + catalog.json
+dbt docs serve      # opens it at localhost:8080
+```
+
+Docs are generated on demand rather than committed — `target/` is gitignored, since it is build output.
+
+---
+
 ## Testing
 
-102 tests in four tiers.
+114 tests in four tiers.
 
 | Tier | Count | Examples |
 |---|---:|---|
-| Generic | 97 | `unique`, `not_null`, `relationships`, `accepted_values`, source freshness |
+| Generic | 109 | `unique`, `not_null`, `relationships`, `accepted_values`, source freshness |
 | dbt_utils | — | `unique_combination_of_columns` on every grain, `expression_is_true` for `high >= low` |
 | Singular | 4 | See below |
 | **Unit** | **1** | Tests logic, not data |
@@ -221,10 +258,12 @@ A -60% return for a stock that never moved — plausible, fabricated, and invisi
 
 ## Next steps
 
+- [x] **Dashboard** — [published in Looker Studio](https://datastudio.google.com/s/s1mqFkaO3Wc), declared as a dbt exposure
+- [x] **dbt docs** — generated with full catalog metadata
+
 - [ ] **GitHub Actions** — a nightly `--daily` + `dbt build`, and a PR workflow building against the `ci` target
 - [ ] **dbt snapshot on `dim_companies`** — SCD Type 2 for sector and market cap over time
 - [ ] **Weekly staging + mart models** — 21,884 rows of weekly history are landed but not yet modelled
-- [ ] **A dashboard** — Looker Studio connects to BigQuery natively
 - [ ] **Custom generic test** — e.g. `assert_within_n_stdev` as a reusable outlier check
 
 ## What I'd do differently
@@ -232,6 +271,8 @@ A -60% return for a stock that never moved — plausible, fabricated, and invisi
 **Model the weekly source first, not last.** I discovered `outputsize=full` was paywalled only after building around an assumed 20-year daily history. The weekly endpoint gives that for free, and finding it earlier would have shaped the marts differently.
 
 **Use views for intermediate models from the start.** They began as `ephemeral`, which meant they couldn't be queried in the console while debugging, and unit tests had nowhere to materialise because an ephemeral model never creates its dataset. Two extra views is a cheap price for both.
+
+**Ship each measure in exactly one unit.** The reporting model originally carried both `volatility_30_session_annualized` (a fraction) and `volatility_pct` (pre-multiplied by 100). Looker Studio's Percent format multiplies by 100 itself, so the dashboard displayed 2,977% instead of 29.8%. Every dbt test passed — the data was correct, the *design* invited the mistake. Tests verify data; they cannot tell you that offering the same measure twice will make someone pick the wrong one. The `_pct` columns are gone.
 
 **Run `dbt parse` before `dbt build`.** It catches syntax errors in seconds without touching the warehouse.
 
@@ -245,8 +286,8 @@ A -60% return for a stock that never moved — plausible, fabricated, and invisi
 ├── ticker_tape/                  # dbt project
 │   ├── models/
 │   │   ├── staging/alpha_vantage/
-│   │   ├── intermediate/
-│   │   └── marts/
+│   │   ├── intermediate/         # + the unit test
+│   │   └── marts/                # dim, facts, rpt_ + _exposures.yml
 │   ├── tests/                    # 4 singular tests
 │   ├── dbt_project.yml
 │   └── packages.yml
