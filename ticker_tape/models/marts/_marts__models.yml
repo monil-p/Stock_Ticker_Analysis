@@ -319,3 +319,119 @@ models:
           arguments:
             expression: "golden_cross_flag is null"
             where: "close_ma_50_session is null"
+
+  - name: rpt_ticker_dashboard
+    description: >
+      A single flat, denormalised view built for BI tools. One row per ticker
+      per session, with company attributes joined on and a handful of
+      presentation-layer conveniences.
+
+      This is a reporting model, not a fact table. It carries no logic that is
+      not already in fct_ticker_performance_daily and dim_companies; it exists
+      because Looker Studio blends data sources awkwardly and re-runs joins on
+      every chart interaction. Giving the BI layer one pre-joined table is
+      faster to query and much simpler to build charts against.
+
+      The rpt_ prefix marks it as a consumer-facing shape rather than a
+      dimensional model. Anything that needs to be correct belongs upstream;
+      only things that need to be convenient belong here.
+    columns:
+      - name: ticker
+        description: Ticker symbol.
+        data_tests:
+          - not_null
+      - name: company_name
+        description: Registered company name, from dim_companies.
+        data_tests:
+          - not_null
+      - name: sector
+        description: Sector label. The primary dashboard filter dimension.
+        data_tests:
+          - not_null
+      - name: industry
+        description: Industry label, finer-grained than sector.
+      - name: exchange
+        description: Listing exchange.
+      - name: currency
+        description: Reporting currency of market_cap.
+      - name: market_cap
+        description: >
+          Market capitalisation at extract time. Denormalised onto every row,
+          so aggregate it with a MAX or an average per ticker rather than a
+          SUM across sessions.
+      - name: trade_date
+        description: Session date. The date dimension for all time series.
+        data_tests:
+          - not_null
+      - name: open_price
+        description: Opening price, unadjusted.
+      - name: high_price
+        description: Session high, unadjusted.
+      - name: low_price
+        description: Session low, unadjusted.
+      - name: close_price
+        description: Closing price, unadjusted.
+        data_tests:
+          - not_null
+      - name: volume
+        description: Shares traded during the session.
+      - name: daily_return
+        description: >
+          Simple return as a FRACTION, not a percentage: 0.015 means +1.5%.
+          Format it as a percent in the BI tool, which applies the x100.
+      - name: close_ma_7_session
+        description: 7-session moving average of close. NULL until the window fills.
+      - name: close_ma_30_session
+        description: 30-session moving average of close. NULL until the window fills.
+      - name: close_ma_50_session
+        description: 50-session moving average of close. NULL until the window fills.
+      - name: volatility_30_session_annualized
+        description: >
+          Annualised 30-session volatility as a FRACTION, not a percentage:
+          0.35 means 35% annualised. Format it as a percent in the BI tool.
+      - name: golden_cross_flag
+        description: >
+          TRUE when the 30-session average is above the 50-session average.
+          Prefer trend_label for anything user-facing.
+      - name: trend_label
+        description: >
+          'Uptrend', 'Downtrend', or 'Insufficient history'. A three-valued
+          string rather than a nullable boolean, because Looker Studio renders
+          NULL booleans as blanks in legends and filter controls, which reads
+          as a rendering fault rather than a real state.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['Uptrend', 'Downtrend', 'Insufficient history']
+      - name: is_latest_session
+        description: >
+          TRUE on the most recent session in the model. Lets scorecards show
+          current values without a date filter that has to be maintained.
+        data_tests:
+          - not_null
+      - name: days_from_latest
+        description: >
+          Calendar days between this session and the most recent one. Powers
+          relative windows ("last 30 days") without date arithmetic in the UI.
+        data_tests:
+          - not_null
+
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns:
+              - ticker
+              - trade_date
+
+      # Exactly one session may be flagged latest, and every ticker must appear
+      # in it -- otherwise scorecards silently drop a company.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "days_from_latest = 0"
+            where: "is_latest_session"
+
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "trend_label = 'Insufficient history'"
+            where: "golden_cross_flag is null"

@@ -1,0 +1,24 @@
+version: 2
+
+exposures:
+  - name: ticker_tape_dashboard
+    label: Ticker Tape Dashboard
+    type: dashboard
+    maturity: high
+    # TODO: replace with the Looker Studio report URL once published.
+    url: https://datastudio.google.com/s/s1mqFkaO3Wc
+    description: >
+      Looker Studio report covering price trend, moving-average crossover and
+      annualised volatility for the tracked tickers, filterable by sector.
+
+      Declaring the dashboard as an exposure puts it in the dbt lineage graph
+      as a downstream node, so `dbt build --select +exposure:ticker_tape_dashboard`
+      rebuilds everything it depends on, and anyone reading the docs can see
+      that this model has a live consumer before they change it.
+
+    depends_on:
+      - ref('rpt_ticker_dashboard')
+
+    owner:
+      name: Monil
+      email: monilraj2014@gmail.com
