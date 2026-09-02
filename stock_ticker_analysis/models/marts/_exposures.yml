@@ -1,8 +1,8 @@
 version: 2
 
 exposures:
-  - name: ticker_tape_dashboard
-    label: Ticker Tape Dashboard
+  - name: stock_ticker_dashboard
+    label: Stock Ticker Analysis Dashboard
     type: dashboard
     maturity: high
     # TODO: replace with the Looker Studio report URL once published.
@@ -12,7 +12,7 @@ exposures:
       annualised volatility for the tracked tickers, filterable by sector.
 
       Declaring the dashboard as an exposure puts it in the dbt lineage graph
-      as a downstream node, so `dbt build --select +exposure:ticker_tape_dashboard`
+      as a downstream node, so `dbt build --select +exposure:stock_ticker_dashboard`
       rebuilds everything it depends on, and anyone reading the docs can see
       that this model has a live consumer before they change it.
 
